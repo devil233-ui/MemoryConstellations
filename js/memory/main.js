@@ -316,6 +316,7 @@ function renderStardustEntries(frags, conMap) {
             + '<div class="sd-detail">'
             + (conStr ? '<div class="sd-constellations">' + conStr + '</div>' : '')
             + '<div class="sd-actions">'
+            + '<button class="sd-act" data-act="edit" data-fid="' + f.id + '">编辑</button>'
             + '<button class="sd-act danger" data-act="delete" data-fid="' + f.id + '">删除</button>'
             + '</div></div></div></div>';
     }).join('');
@@ -334,6 +335,15 @@ function renderStardustEntries(frags, conMap) {
             if (cid) { closeStardust(); gotoConstellation(cid); }
         });
     });
+    body.querySelectorAll('.sd-act[data-act="edit"]').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const entry = btn.closest('.sd-entry');
+            const fid = parseInt(btn.dataset.fid);
+            const contentEl = entry.querySelector('.sd-content');
+            openFragmentEditor(fid, contentEl.textContent || '', saved => { contentEl.textContent = saved; });
+        });
+    });
     body.querySelectorAll('.sd-act[data-act="delete"]').forEach(btn => {
         btn.addEventListener('click', async e => {
             e.stopPropagation();
@@ -345,6 +355,51 @@ function renderStardustEntries(frags, conMap) {
                 if (res.ok) { btn.closest('.sd-entry').remove(); }
             } catch (_) {}
         });
+    });
+}
+
+
+function openFragmentEditor(fid, text, onSaved) {
+    const stale = document.getElementById('sd-editor-overlay');
+    if (stale) stale.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'sd-editor-overlay';
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(6,8,20,.72);display:flex;align-items:center;justify-content:center;padding:24px;';
+    wrap.innerHTML = '<div style="width:min(760px,100%);background:#0e1224;border:1px solid #2a3150;border-radius:14px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.5)">'
+        + '<div style="color:#cfd6ff;font-size:13px;margin-bottom:8px">编辑碎片 #' + fid + '</div>'
+        + '<textarea id="sd-editor-text" spellcheck="false" style="width:100%;height:340px;box-sizing:border-box;background:#080b18;color:#dfe4ff;border:1px solid #2a3150;border-radius:10px;padding:10px;font:13px/1.7 ui-monospace,Menlo,Consolas,monospace;resize:vertical"></textarea>'
+        + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">'
+        + '<button id="sd-editor-cancel" style="padding:7px 14px;border-radius:8px;border:1px solid #2a3150;background:transparent;color:#9aa4c8;cursor:pointer">取消</button>'
+        + '<button id="sd-editor-save" style="padding:7px 14px;border-radius:8px;border:1px solid #3b4d9a;background:#1a2450;color:#dfe4ff;cursor:pointer">保存</button>'
+        + '</div></div>';
+    document.body.appendChild(wrap);
+    const ta = wrap.querySelector('#sd-editor-text');
+    ta.value = text;
+    ta.focus();
+    const close = () => wrap.remove();
+    wrap.querySelector('#sd-editor-cancel').addEventListener('click', close);
+    wrap.addEventListener('click', e => { if (e.target === wrap) close(); });
+    wrap.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+    wrap.querySelector('#sd-editor-save').addEventListener('click', async () => {
+        const btn = wrap.querySelector('#sd-editor-save');
+        const next = ta.value;
+        btn.disabled = true;
+        btn.textContent = '保存中…';
+        try {
+            const token = localStorage.getItem('token');
+            const res = await fetch('/api/fragment/' + fid, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+                body: JSON.stringify({ content: next }),
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            onSaved(next);
+            close();
+        } catch (err) {
+            btn.disabled = false;
+            btn.textContent = '保存失败，点我重试';
+            console.error('[stardust] 保存碎片失败', err);
+        }
     });
 }
 

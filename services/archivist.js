@@ -1442,10 +1442,10 @@ async function classifyFragments(opts = {}) {
     const unclassified = db.prepare(`
         SELECT mf.id, mf.content, mf.emotional_weight, mf.created_at
         FROM memory_fragments mf
-        // ⚠️ 入口含 consolidated/cooling：整合跑完会把碎片改成 'consolidated'，
-        // 而另一条管线也在抢同一批碎片——谁先到谁说了算。碎片一旦被写成 episode
-        // 就永久退出分类，fragment_entities 的链接再也不会建立。
-        // 配套是通的：实体概述读碎片时本来就认这三个状态。
+        -- ⚠️ 入口含 consolidated/cooling：整合跑完会把碎片改成 'consolidated'，
+        -- 而另一条管线也在抢同一批碎片——谁先到谁说了算。碎片一旦被写成 episode
+        -- 就永久退出分类，fragment_entities 的链接再也不会建立。
+        -- 配套是通的：实体概述读碎片时本来就认这三个状态。
         WHERE mf.status IN ('active', 'consolidated', 'cooling')
           AND mf.source NOT IN ('music', 'book')
           AND mf.id NOT IN (SELECT DISTINCT fragment_id FROM fragment_entities)

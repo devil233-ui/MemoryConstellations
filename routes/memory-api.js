@@ -1405,6 +1405,22 @@ router.put('/api/fragment/:id', requireAuth, (req, res) => {
 
         params.push(req.params.id);
         db.prepare(`UPDATE memory_fragments SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+        // 正文改了就重算向量，否则语义检索还指着旧文本
+        if (content !== undefined) {
+            const memoryService = require('../services/memory');
+            Promise.resolve()
+                .then(() => memoryService.getLocalEmbedding(content))
+                .then((embedding) => {
+                    if (!Array.isArray(embedding) || embedding.length === 0) return null;
+                    return memoryService.chromaDBOperation('upsert', {
+                        id: 'fragment_' + req.params.id,
+                        embedding,
+                        metadata: { content: String(content).slice(0, 2000) },
+                    });
+                })
+                .catch((err) => console.error('[fragment API] 重算向量失败:', err.message));
+        }
         res.json({ success: true });
     } catch (e) {
         console.error('[fragment API] 更新失败:', e.message);
@@ -1413,58 +1429,76 @@ router.put('/api/fragment/:id', requireAuth, (req, res) => {
 });
 
 // DELETE /api/fragment/:id — 真删除碎片 + 级联降权同源碎片
+// 2026-10-31 修：先清引用表再删主体（fragment_entities/entity_timeline/memory_claims/fragment_categories 有外键），
+// 且降权改为「删成功之后」才做——否则删除失败重试一次就把邻居权重再砍半一次。
 router.delete('/api/fragment/:id', requireAuth, async (req, res) => {
     const db = getDb();
+    const id = Number(req.params.id);
     try {
-        const frag = db.prepare(`SELECT id, content, source_msg_ids, emotional_weight FROM memory_fragments WHERE id = ?`).get(req.params.id);
+        const frag = db.prepare(`SELECT id, content, source_msg_ids, emotional_weight FROM memory_fragments WHERE id = ?`).get(id);
         if (!frag) return res.status(404).json({ error: '碎片不存在' });
 
-        // 写入纠正日志（删除即纠正信号）
+        // 先算同源碎片（只算，不改）
+        let sourceIds = [];
+        try { sourceIds = JSON.parse(frag.source_msg_ids || '[]'); } catch (_) {}
+        const placeholders = sourceIds.map(() => '?').join(',');
+
+        // 事务：清引用 → 删主体。任何一步失败整体回滚，不会留下半删状态
+        const cleanup = db.transaction(() => {
+            db.prepare(`DELETE FROM fragment_entities WHERE fragment_id = ?`).run(id);
+            db.prepare(`DELETE FROM entity_timeline WHERE fragment_id = ?`).run(id);
+            db.prepare(`DELETE FROM memory_claims WHERE fragment_id = ?`).run(id);
+            db.prepare(`DELETE FROM fragment_categories WHERE fragment_id = ?`).run(id);
+            const info = db.prepare(`DELETE FROM memory_fragments WHERE id = ?`).run(id);
+            return info.changes;
+        });
+        let changes = 0;
+        try {
+            changes = cleanup();
+        } catch (e) {
+            console.error(`❌ DELETE /api/fragment/${id} 事务失败:`, e.message);
+            return res.status(500).json({ error: e.message });
+        }
+        if (!changes) return res.status(404).json({ error: '碎片不存在' });
+
+        // 删除成功后再写纠正日志 + 级联降权
         try {
             db.prepare(`INSERT INTO correction_log (target_type, target_id, wrong_summary, correct_summary, source, status, created_at)
                 VALUES ('fragment', ?, ?, '', 'manual', 'active', datetime('now'))`).run(
-                frag.id, (frag.content || '').slice(0, 80)
+                id, (frag.content || '').slice(0, 80)
             );
-            console.log(`[Correction] 碎片删除写入纠正日志 #${frag.id}`);
+            console.log(`[Correction] 碎片删除写入纠正日志 #${id}`);
         } catch (logErr) {
             console.error('⚠️ correction_log写入失败:', logErr.message);
         }
 
-        // 级联降权：查同源碎片（同一批对话提取的），emotional_weight × 0.5
-        let sourceIds = [];
-        try { sourceIds = JSON.parse(frag.source_msg_ids || '[]'); } catch (_) {}
-        if (sourceIds.length > 0) {
-            const placeholders = sourceIds.map(() => '?').join(',');
+        // 空碎片（正文为空）属于垃圾清理，不该当作「纠正信号」去惩罚同批邻居
+        let demoted = 0;
+        if (sourceIds.length > 0 && (frag.content || '').trim()) {
             const sameSource = db.prepare(`
                 SELECT id, source_msg_ids FROM memory_fragments
-                WHERE id != ? AND status = 'active'
-                  AND source_msg_ids IS NOT NULL
-            `).all(frag.id).filter(f => {
+                WHERE id != ? AND status = 'active' AND source_msg_ids IS NOT NULL
+            `).all(id).filter(f => {
                 try {
                     const ids = JSON.parse(f.source_msg_ids || '[]');
-                    return ids.some(id => sourceIds.includes(id));
+                    return ids.some(x => sourceIds.includes(x));
                 } catch (_) { return false; }
             });
-
-            if (sameSource.length > 0) {
-                const demote = db.prepare("UPDATE memory_fragments SET emotional_weight = MAX(0.1, emotional_weight * 0.5), lifecycle_updated_at = datetime('now') WHERE id = ?");
-                for (const s of sameSource) demote.run(s.id);
-                console.log(`[Correction] 级联降权: ${sameSource.length}条同源碎片 ew×0.5 (source: fragment #${frag.id})`);
-            }
+            const demote = db.prepare("UPDATE memory_fragments SET emotional_weight = MAX(0.1, emotional_weight * 0.5), lifecycle_updated_at = datetime('now') WHERE id = ?");
+            for (const s of sameSource) { demote.run(s.id); demoted++; }
+            if (demoted) console.log(`[Correction] 级联降权: ${demoted}条同源碎片 ew×0.5 (source: fragment #${id})`);
         }
 
-        // 删除 ChromaDB 向量
+        // 删除 ChromaDB 向量（失败不影响主流程）
         try {
             const { chromaDBOperation } = require('../services/memory');
-            await chromaDBOperation('delete', { id: `fragment_${frag.id}` });
+            await chromaDBOperation('delete', { id: `fragment_${id}` });
         } catch (e) {
-            console.error(`ChromaDB delete fragment_${frag.id} failed:`, e.message);
+            console.error(`ChromaDB delete fragment_${id} failed:`, e.message);
         }
 
-        // 真删除
-        db.prepare(`DELETE FROM memory_fragments WHERE id = ?`).run(frag.id);
-        console.log(`🗑️ Fragment hard-deleted: #${frag.id} "${(frag.content || '').slice(0, 50)}"`);
-        res.json({ success: true, demotedSameSource: true });
+        console.log(`🗑️ Fragment hard-deleted: #${id} "${(frag.content || '').slice(0, 50)}"`);
+        res.json({ success: true, demotedSameSource: demoted });
 
     } catch (e) {
         console.error(`❌ DELETE /api/fragment/${req.params.id}:`, e.message);

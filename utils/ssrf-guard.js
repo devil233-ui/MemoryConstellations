@@ -141,6 +141,15 @@ function isPrivateIP(ip) {
 // - 不允许携带用户名/密码
 // - hostname 解析出的所有地址都不能是私有/内网/保留地址
 // 校验通过则返回 URL 对象，否则 throw Error（中文错误信息）
+// [本地补丁 2026-10-29] 允许显式放行回环地址（127.0.0.1/::1），用于把记忆管线接到本机的 OpenAI 兼容反代。
+// 上游默认禁止一切私有/回环地址；这里只放开回环，其它私网段（10/172.16/192.168/100.64）仍然拒绝。
+// 关闭方法：SSRF_ALLOW_LOOPBACK=0；升级上游会覆盖本文件，需重打。
+const ALLOW_LOOPBACK = process.env.SSRF_ALLOW_LOOPBACK !== '0';
+function isLoopbackIP(ip) {
+    const host = stripBrackets(String(ip || ''));
+    return host === '127.0.0.1' || host === '::1' || host === '::ffff:127.0.0.1';
+}
+
 async function validateEndpoint(endpointString) {
     let url;
     try {
@@ -149,7 +158,17 @@ async function validateEndpoint(endpointString) {
         throw new Error('无效的endpoint地址');
     }
 
-    if (url.protocol !== 'https:') {
+    // [本地补丁] 主机名解析结果全为回环地址时，允许 http（本机反代不会出网）
+    const earlyHost = stripBrackets(url.hostname.toLowerCase());
+    let loopbackOnly = false;
+    if (ALLOW_LOOPBACK) {
+        try {
+            const probe = await dns.promises.lookup(earlyHost, { all: true, verbatim: true });
+            loopbackOnly = probe.length > 0 && probe.every(({ address }) => isLoopbackIP(address));
+        } catch (e) { loopbackOnly = false; }
+    }
+
+    if (url.protocol !== 'https:' && !loopbackOnly) {
         throw new Error('不允许访问该endpoint地址：仅支持HTTPS');
     }
     if (url.username || url.password) {
@@ -170,6 +189,7 @@ async function validateEndpoint(endpointString) {
     }
 
     for (const { address } of addresses) {
+        if (ALLOW_LOOPBACK && isLoopbackIP(address)) continue; // [本地补丁] 回环放行
         if (isPrivateIP(address)) {
             throw new Error('不允许访问该endpoint地址');
         }

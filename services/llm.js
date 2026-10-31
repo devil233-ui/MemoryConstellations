@@ -4,8 +4,6 @@
 
 const axios = require('axios');
 const { ProxyAgent } = require('undici');
-const { spawn } = require('child_process');
-const path = require('path');
 const { get_encoding } = require('tiktoken');
 const { getDb } = require('../database');
 
@@ -121,27 +119,15 @@ function getAxiosProxy(url) {
 // =================================================================
 
 async function getLocalEmbedding(text) {
-    return new Promise((resolve, reject) => {
-        const python = spawn(path.join(__dirname, '..', 'venv', 'bin', 'python'), [
-            path.join(__dirname, '..', 'chroma_helper.py'),
-            'embed',
-            JSON.stringify({ text })
-        ]);
-        let stdout = '';
-        python.stdout.on('data', (d) => stdout += d.toString());
-        python.stderr.on('data', (d) => console.error('LocalEmbed Error:', d.toString()));
-        python.on('close', (code) => {
-            if (code === 0) {
-                try {
-                    const result = JSON.parse(stdout);
-                    if (result.embedding) resolve(result.embedding);
-                    else reject(new Error(result.error || 'No embedding'));
-                } catch (e) { reject(e); }
-            } else {
-                reject(new Error(`Local embed exit ${code}`));
-            }
-        });
+    const endpoint = (process.env.CHROMA_URL || 'http://127.0.0.1:7707').replace(/\/$/, '');
+    const resp = await fetch(`${endpoint}/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
     });
+    const result = await resp.json();
+    if (result.embedding) return result.embedding;
+    throw new Error(result.error || 'No embedding');
 }
 
 // =================================================================
@@ -282,6 +268,14 @@ async function callLLM(geminiMessages, systemPrompt, tools = null, generationCon
         apiConfig = db.prepare('SELECT * FROM api_configs WHERE is_default = 1').get();
     }
     
+    if (!apiConfig) {
+        // 本地补丁：硬编码的 apiConfigId（如 archivist 的 36）在新库里不存在时，
+        // 回退到默认配置，而不是让整条管线报错停摆。
+        if (apiConfigId !== null && apiConfigId !== undefined) {
+            console.warn(`[llm] apiConfigId=${apiConfigId} 不存在，回退到默认配置`);
+            apiConfig = db.prepare('SELECT * FROM api_configs WHERE is_default = 1').get();
+        }
+    }
     if (!apiConfig) {
         throw new Error('未找到有效的API配置');
     }

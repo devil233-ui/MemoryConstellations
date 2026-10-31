@@ -6,7 +6,7 @@
 //   2. ★ 向量联想：embed fragment → ChromaDB 查相似碎片 → 聚合已有 entity 关联 →
 //                候选实体投票
 //   3. LLM 指代消解：结合候选实体列表 + 描述，做单选判断（一条碎片一个直接归属）
-//   4. ★ 派生关联：从直接实体出发，沿 related_entity_ids 自动派生二级链接，
+//   4. ★ 派生关联：从直接实体出发，沿 related_entities 自动派生二级链接，
 //                标记为 derived_from，供 Librarian/overview 做辅助参考
 //
 // 写入目标：fragment_entities 多对多表（+ 兼容 memory_fragments.entity_id 旧字段）
@@ -37,7 +37,7 @@ function getAliasData() {
 
     const db = getDb();
     const rows = db.prepare(`
-        SELECT id, name, category, aliases, facts, related_entity_ids FROM entity_profiles
+        SELECT id, name, category, aliases, facts, related_entities FROM entity_profiles
         WHERE name IS NOT NULL AND category != 'term'
     `).all();
 
@@ -50,7 +50,7 @@ function getAliasData() {
     for (const row of rows) {
         let aliasList = [], relatedIds = [];
         try { aliasList = JSON.parse(row.aliases || '[]'); } catch (_) {}
-        try { relatedIds = JSON.parse(row.related_entity_ids || '[]'); } catch (_) {}
+        try { relatedIds = JSON.parse(row.related_entities || '[]'); } catch (_) {}
 
         knownEntities.push({ id: row.id, name: row.name, aliases: aliasList });
 
@@ -103,7 +103,7 @@ function linkFragmentToEntity(fragmentId, entityId, relation, confidence, classi
 }
 
 // ── 内部：从直接实体派生二级关联 ──
-// 读取 entity 的 related_entity_ids，写入 fragment_entities（标记 derived_from）
+// 读取 entity 的 related_entities，写入 fragment_entities（标记 derived_from）
 function deriveEntityLinks(fragmentId, directEntityId) {
     const db = getDb();
     const { relationGraph, entityDescriptors } = _aliasCache;  // 可能在当前 tick 内已过期，fallback 到实查
@@ -111,9 +111,9 @@ function deriveEntityLinks(fragmentId, directEntityId) {
     // 先查缓存，缓存没有则查 DB
     let relatedIds = relationGraph?.get(directEntityId);
     if (!relatedIds) {
-        const row = db.prepare('SELECT related_entity_ids FROM entity_profiles WHERE id = ?').get(directEntityId);
-        if (!row?.related_entity_ids) return 0;
-        try { relatedIds = JSON.parse(row.related_entity_ids); } catch (_) { return 0; }
+        const row = db.prepare('SELECT related_entities FROM entity_profiles WHERE id = ?').get(directEntityId);
+        if (!row?.related_entities) return 0;
+        try { relatedIds = JSON.parse(row.related_entities); } catch (_) { return 0; }
         if (!relatedIds?.length) return 0;
     }
 

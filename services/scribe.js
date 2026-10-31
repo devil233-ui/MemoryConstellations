@@ -17,77 +17,61 @@ const { chromaDBOperation } = require('./memory');
 const { WORLD_CONTEXT } = require('./worldContext');
 const { renderTagSpecForPrompt } = require('./tagRouting');
 const { hashFragmentContent } = require('../utils/text');
-const { spawn } = require('child_process');
-const path = require('path');
 
-// 将新写入的 fragments 自动索引到 ChromaDB
-function indexNewFragments(fragmentIds) {
-    return new Promise((resolve, reject) => {
-        if (!fragmentIds || fragmentIds.length === 0) return resolve(0);
+// 将新写入的 fragments 自动索引到向量库（chroma-lite / chroma_service 的 /index_batch）
+// 旧实现 spawn venv/bin/python + 本地 python 助手脚本；本机没有该 venv，子进程的 'error'
+// 事件未捕获，ENOENT 会把整个 MC 进程带走（fail-loud），所以统一改走 HTTP。
+async function indexNewFragments(fragmentIds) {
+    if (!fragmentIds || fragmentIds.length === 0) return 0;
 
-        const db = getDb();
-        const placeholders = fragmentIds.map(() => '?').join(',');
-        const fragments = db.prepare(`
-            SELECT id, type, entity, content, emotional_weight, source, source_date
-            FROM memory_fragments WHERE id IN (${placeholders})
-        `).all(...fragmentIds);
+    const db = getDb();
+    const placeholders = fragmentIds.map(() => '?').join(',');
+    const fragments = db.prepare(`
+        SELECT id, type, entity, content, emotional_weight, source, source_date
+        FROM memory_fragments WHERE id IN (${placeholders})
+    `).all(...fragmentIds);
 
-        const items = fragments.map(f => ({
-            id: `fragment_${f.id}`,
-            text: `${f.entity}: ${f.content}`,
-            metadata: {
-                type: f.type,
-                entity: f.entity,
-                content: f.content,
-                emotional_weight: f.emotional_weight,
-                source: f.source,
-                source_date: f.source_date,
-            }
-        }));
+    const items = fragments.map(f => ({
+        id: `fragment_${f.id}`,
+        text: (() => {
+            const body = String(f.content || "").replace(/\s+/g, " ").trim();
+            const head = `${f.entity}：`;
+            const headAscii = `${f.entity}:`;
+            return body.startsWith(head) || body.startsWith(headAscii) ? body : `${f.entity}: ${body}`;
+        })(),
+        metadata: {
+            type: f.type,
+            entity: f.entity,
+            content: f.content,
+            emotional_weight: f.emotional_weight,
+            source: f.source,
+            source_date: f.source_date,
+        }
+    }));
 
-        const python = spawn(path.join(__dirname, '..', 'venv', 'bin', 'python'), [
-            path.join(__dirname, '..', 'chroma_helper.py'),
-            'index_batch',
-            JSON.stringify({ items })
-        ]);
+    try {
+        const result = await chromaDBOperation('index_batch', { items });
+        const update = db.prepare('UPDATE memory_fragments SET chroma_id = ? WHERE id = ?');
+        const duplicates = Array.isArray(result.duplicates) ? result.duplicates : [];
+        const dupIds = new Set(duplicates.map(d => String(d.new_id)));
 
-        let stdout = '';
-        python.stdout.on('data', (d) => stdout += d.toString());
-        python.stderr.on('data', (d) => console.error('[Scribe] Chroma index error:', d.toString()));
-        python.on('close', (code) => {
-            if (code === 0) {
-                try {
-                    const result = JSON.parse(stdout);
-                    // 更新 chroma_id
-                    const update = db.prepare('UPDATE memory_fragments SET chroma_id = ? WHERE id = ?');
-                    for (const item of items) {
-                        update.run(item.id, item.id.replace('fragment_', ''));
-                    }
-                    console.log(`[Scribe] ChromaDB indexed ${result.indexed} new fragments`);
+        for (const item of items) {
+            if (dupIds.has(item.id)) continue;
+            update.run(item.id, Number(item.id.replace('fragment_', '')));
+        }
+        for (const d of duplicates) {
+            update.run(`dup_of_${d.existing_id}`, Number(String(d.new_id).replace('fragment_', '')));
+            console.log(`[Curator] 重复跳过: ${d.new_id} ≈ ${d.existing_id} (sim=${d.similarity})`);
+            console.log(`  new: ${d.new_preview}`);
+            console.log(`  old: ${d.existing_preview}`);
+        }
 
-                    // 处理重复项：标记 chroma_id 指向已存在的记忆
-                    if (result.duplicates?.length > 0) {
-                        for (const d of result.duplicates) {
-                            const newRawId = d.new_id.replace('fragment_', '');
-                            db.prepare('UPDATE memory_fragments SET chroma_id = ? WHERE id = ?')
-                                .run(`dup_of_${d.existing_id}`, newRawId);
-                            console.log(`[Curator] 重复跳过: ${d.new_id} ≈ ${d.existing_id} (sim=${d.similarity})`);
-                            console.log(`  new: ${d.new_preview}`);
-                            console.log(`  old: ${d.existing_preview}`);
-                        }
-                    }
-
-                    resolve(result.indexed);
-                } catch (e) {
-                    console.error('[Scribe] Chroma index parse error:', e.message);
-                    resolve(0);
-                }
-            } else {
-                console.error(`[Scribe] Chroma index failed (exit ${code})`);
-                resolve(0);
-            }
-        });
-    });
+        console.log(`[Scribe] 向量索引完成: ${result.indexed ?? (items.length - dupIds.size)} 条入库，重复跳过 ${duplicates.length} 条`);
+        return result.indexed ?? 0;
+    } catch (e) {
+        console.error('[Scribe] 向量索引失败（碎片已入库，不影响后续）:', e.message);
+        return 0;
+    }
 }
 
 const SCRIBE_CONFIG = {
@@ -111,7 +95,7 @@ function isValidTimestamp(ts) {
     return !isNaN(d.getTime()) && ts.startsWith('20'); // 简单但有效：必须是可解析日期且以年份开头
 }
 
-const SCRIBE_SYSTEM_PROMPT = `你是Scribe，${AI.name}记忆系统的书记员。
+const SCRIBE_SYSTEM_PROMPT = `群聊正文规则：记录常以「昵称：内容」开头（如 devil：…、鲸汐哦qwq：…）。提取时主语要写那个昵称本人；只有昵称确实是 ${USER.name} 时才用 ${USER.name}，其他人的话不要归到 ${USER.name} 名下，也不要合并成一个人。\n\n你是Scribe，${AI.name}记忆系统的书记员。
 你的职责是从对话记录中提取值得长期保存的记忆片段。
 你必须严格输出JSON，不得包含任何其他文字或markdown，严禁使用代码块包裹。
 
@@ -162,6 +146,15 @@ ${AI.name}的发言只提取以下两类，其余全部忽略：
    ⚠️ **物理/生理事实的绝对界限**：${AI.name}是纯粹的数字存在，{{ai.pronoun}}不具备任何肉体感知。所有涉及${USER.name}物理状态、健康状况、病理症状、用药细节等生理事实，**绝对不以${AI.name}的单方面描述为准**。若这些信息未在${USER.name}的原话中被直接确认，一律视为${AI.name}出于关切产生的推测或语境填补，绝不可作为事实提取。
 
 2. **{{ai.pronoun}}对${USER.name}或二人关系的强烈情感表达**：那些展现恐惧、依赖、骄傲或执念的情感表达，定义了他们之间正在发生的事。
+
+## 群聊里的其他参与者
+
+群聊里除了${USER.name}和${AI.name}，还有别人。他们的发言同样可以成片，规则如下：
+
+- **主语必须是发言人昵称**（消息前缀里的人名），不要写成「群里」「大家」「有人」。
+- 只提取关于这个人的**稳定信息**：偏好、状态、正在做的事、与${USER.name}／${AI.name}的关系、明确表态。
+- 纯接话、玩梗、表情包、@人、没有信息量的短句**不提取**。
+- 同一批消息里几个人的话分开成条，禁止把不同人的发言合成一条。
 
 以下内容**绝对禁止提取**。命中任一条 → 不写入 entries。
 
@@ -229,7 +222,7 @@ ${USER.name}同一天可能发生多个独立的事件——它们只是碰巧�
       "entities": [
         {"name": "${USER.name}|${AI.name}|人名|地名|作品名|事件名", "relation": "related_to|knows|visited|consumed|created|attended|cares_for"}
       ],
-      "content": "第三人称，必须以人名或实体名开头或句中明确点名（${USER.name}/${AI.name}/具体人名/地名/作品名），禁止用他/她/承认/表示等无名主语开头；不超过80字",
+      "content": "第三人称，必须以这句话的发言人昵称开头（用消息前缀里的人名，不用「群里」「大家」这类集合名词），同一段里不同人说的话要分开成条、禁止合并；句中可点名其他实体（${USER.name}/${AI.name}/具体人名/地名/作品名），禁止用他/她/承认/表示等无名主语开头；不超过80字",
       "emotional_weight": 参见评分锚定表（必填，不得省略）",
       "value_tags": [],
       "source": "chat|wechat|book|game",
@@ -818,8 +811,10 @@ async function runScribe(messages, since) {
                 entityList = [{ name: USER.name, relation: 'related_to' }];
             }
 
-            // Primary entity for the legacy 'entity' column (first entity in list)
-            const primaryEntity = entityList[0].name || USER.name;
+            // Primary entity for the legacy 'entity' column：以 content 开头的实体为准（防止把说话人记成 USER）
+            const _content = String(entry.content || '').trim();
+            const _subject = entityList.find(e => e.name && _content.startsWith(String(e.name)));
+            const primaryEntity = (_subject && _subject.name) || entityList[0].name || USER.name;
 
             // source: 游戏模式的消息 → source='game'，否则沿用 LLM 输出或默认 'chat'
             const fragmentSource = msgChatMode === 'game' ? 'game' : (entry.source || 'chat');
